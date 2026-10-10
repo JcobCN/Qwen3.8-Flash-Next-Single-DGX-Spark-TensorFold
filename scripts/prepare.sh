@@ -44,8 +44,12 @@ built_hash=$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$I
 free_gb() { df -BG --output=avail "$1" 2>/dev/null | tail -1 | tr -dc '0-9'; }
 fs_of()   { df --output=target "$1" 2>/dev/null | tail -1; }
 need_model=0; need_image=0
-[[ -d "$(model_cache_dir)/snapshots" ]] || need_model=$MIN_FREE_GB
-[[ $REBUILD -eq 0 && "$built_hash" == "$PATCHES_HASH" ]] || need_image=$IMAGE_FREE_GB
+if ! is_local_model && ! ls -d "$(model_cache_dir)/snapshots" >/dev/null 2>&1; then
+  need_model=$MIN_FREE_GB
+fi
+if [[ $REBUILD -eq 1 ]] || (! docker image inspect "$IMAGE" >/dev/null 2>&1 && ! docker image inspect "${PREIMAGE:-}" >/dev/null 2>&1); then
+  need_image=$IMAGE_FREE_GB
+fi
 docker_root=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || true)
 if [[ -z "$docker_root" || "$(fs_of "$docker_root")" == "$(fs_of "$HF_CACHE")" ]]; then
   need=$((need_model + need_image)); have=$(free_gb "$HF_CACHE")
@@ -61,19 +65,31 @@ log "Disk: $(free_gb "$HF_CACHE") GB free under $HF_CACHE"
 # ---------------------------------------------------------------- 2. image
 # Local fixes in ./patches (unified diffs against site-packages, applied with patch -p0) are baked into the image.
 # The image is rebuilt when they change; the TensorFold install layer stays cached, so that takes seconds.
-prebuilt="$GHCR_IMAGE:${TF_VERSION}-${PATCHES_HASH}"
-if [[ $REBUILD -eq 0 && "${PULL:-1}" == 1 && "$built_hash" != "$PATCHES_HASH" ]]; then
-  log "Pulling the prebuilt image $prebuilt (~11 GB; PULL=0 builds instead)"
-  if docker pull "$prebuilt" && \
-     [[ "$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$prebuilt")" == "$PATCHES_HASH" ]]; then
+prebuilt="${PREIMAGE:-$GHCR_IMAGE:${TF_VERSION}-${PATCHES_HASH}}"
+image_ready=0
+
+if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  image_ready=1
+fi
+
+if [[ $REBUILD -eq 0 && "${PULL:-1}" == 1 && $image_ready -eq 0 ]]; then
+  if docker image inspect "$prebuilt" >/dev/null 2>&1; then
     docker tag "$prebuilt" "$IMAGE"
-    built_hash=$PATCHES_HASH
-    log "Using $prebuilt as $IMAGE"
+    image_ready=1
+    log "Using local $prebuilt as $IMAGE"
   else
-    warn "could not pull $prebuilt (no image for these patches, the package is not public, or no network): building it locally"
+    log "Pulling the prebuilt image $prebuilt (~11 GB; PULL=0 builds instead)"
+    if docker pull "$prebuilt"; then
+      docker tag "$prebuilt" "$IMAGE"
+      image_ready=1
+      log "Using $prebuilt as $IMAGE"
+    else
+      warn "could not pull $prebuilt (no image for these patches, the package is not public, or no network): building it locally"
+    fi
   fi
 fi
-if [[ $REBUILD -eq 1 ]] || ! docker image inspect "$IMAGE" >/dev/null 2>&1 || [[ "$built_hash" != "$PATCHES_HASH" ]]; then
+
+if [[ $REBUILD -eq 1 || $image_ready -eq 0 ]]; then
   docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 && [[ $REBUILD -eq 0 ]] || { log "Pulling base image $BASE_IMAGE"; docker pull "$BASE_IMAGE"; }
 
   log "Building $IMAGE (TensorFold $TF_VERSION, patches $PATCHES_HASH: $(patch_files 2>/dev/null | xargs -rn1 basename | paste -sd' ' || true))"
@@ -106,7 +122,7 @@ ENV HF_HOME=/root/.cache/huggingface \
 WORKDIR /workspace
 DOCKERFILE
 else
-  log "Image $IMAGE already built with patches $PATCHES_HASH (use --rebuild to force)"
+  log "Image $IMAGE already available (use --rebuild to force)"
 fi
 docker run --rm --entrypoint tensorfold "$IMAGE" --version 2>/dev/null | tail -1
 
@@ -116,30 +132,42 @@ tf_run() {
   # a token only by name, and only when set (never on the command line); else huggingface_hub finds the token file
   # in the mounted cache. The model is public, so none is needed.
   local token=(); [[ -n "${HF_TOKEN:-}" ]] && token=(-e HF_TOKEN)
+  local model_mount=()
+  if is_local_model; then
+    model_mount=(-v "${MODEL_DIR:-$MODEL_ID}":/model)
+  fi
   docker run --rm --ipc=host --network host --entrypoint tensorfold "${token[@]}" \
+    "${model_mount[@]}" \
     -v "$HF_CACHE":/root/.cache/huggingface \
     -v "$KERNEL_CACHE":/cache \
     "$IMAGE" "$@"
 }
 
 # ---------------------------------------------------------------- 3. download
-log "Downloading $MODEL_ID into $HF_CACHE/hub (resumes if interrupted)"
-if command -v hf >/dev/null; then
-  # Host CLI: resumable, parallel, writes the standard HF cache layout.
-  hf download "$MODEL_ID" --cache-dir "$HF_CACHE/hub"
+if is_local_model; then
+  local_target="${MODEL_DIR:-$MODEL_ID}"
+  [[ -d "$local_target" ]] || die "local model directory $local_target does not exist"
+  log "Using local model directory: $local_target ($(du -shL "$local_target" 2>/dev/null | cut -f1 || true)) mounted to /model"
 else
-  warn "host 'hf' CLI not found, downloading from inside the container"
-fi
-# `tensorfold pull` is the documented path; with the files already cached it only checks/completes them.
-tf_run pull "$MODEL_ID"
+  log "Downloading $MODEL_ID into $HF_CACHE/hub (resumes if interrupted)"
+  if command -v hf >/dev/null; then
+    # Host CLI: resumable, parallel, writes the standard HF cache layout.
+    hf download "$MODEL_ID" --cache-dir "$HF_CACHE/hub"
+  else
+    warn "host 'hf' CLI not found, downloading from inside the container"
+  fi
+  # `tensorfold pull` is the documented path; with the files already cached it only checks/completes them.
+  tf_run pull "$MODEL_ID"
 
-snapshot=$(ls -d "$(model_cache_dir)"/snapshots/*/ 2>/dev/null | head -1)
-[[ -n "$snapshot" ]] || die "no snapshot found under $(model_cache_dir)"
-log "Checkpoint: $snapshot ($(du -shL "$snapshot" | cut -f1))"
+  snapshot=$(ls -d "$(model_cache_dir)"/snapshots/*/ 2>/dev/null | head -1)
+  [[ -n "$snapshot" ]] || die "no snapshot found under $(model_cache_dir)"
+  log "Checkpoint: $snapshot ($(du -shL "$snapshot" | cut -f1))"
+fi
 
 # ---------------------------------------------------------------- 4. verify
-log "Verifying checkpoint with tensorfold info"
-tf_run info "$MODEL_ID"
+target_model="$(container_model_target)"
+log "Verifying checkpoint with tensorfold info $target_model"
+tf_run info "$target_model"
 
 prepared_state > "$PREPARED_MARKER"
 log "Done. Start the server with ./start.sh (port $PORT)."

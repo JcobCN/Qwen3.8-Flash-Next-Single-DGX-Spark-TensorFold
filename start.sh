@@ -73,7 +73,7 @@ source ./scripts/banner.sh
 echo
 banner                                             # the TensorFold ribbon and MIA AI LAB (terminals only)
 printf '\n%s  Mia'"'"'s TensorFold Start Script%s\n' "$M" "$R"
-printf '%s  %s · %s x %s tokens · %s KV · port %s%s\n\n' "$D" "$MODEL_ID" "$(arg_value --parallel)" \
+printf '%s  %s · %s x %s tokens · %s KV · port %s%s\n\n' "$D" "${MODEL_DIR:-$MODEL_ID}" "$(arg_value --parallel)" \
   "$(arg_value --context)" "$(arg_value --kv-dtype)" "$PORT" "$R"
 STEPS=5
 step() { printf '%s[%s/%s]%s %s%s%s\n' "$M" "$1" "$STEPS" "$R" "$B" "$2" "$R"; }
@@ -98,18 +98,23 @@ if [[ "${PREPARE:-auto}" == 1 || ( "${PREPARE:-auto}" != 0 && "$(prepared_state 
   log "Not ready yet: running scripts/prepare.sh (the first time this pulls the image and downloads ~106 GiB)"
   ./scripts/prepare.sh
 else
-  log "Ready: $IMAGE and $MODEL_ID${PREPARE:+ (PREPARE=$PREPARE)}"
+  log "Ready: $IMAGE and ${MODEL_DIR:-$MODEL_ID}${PREPARE:+ (PREPARE=$PREPARE)}"
 fi
 why="scripts/prepare.sh did not"; [[ "${PREPARE:-auto}" == 0 ]] && why="PREPARE=0 skipped scripts/prepare.sh, which would"
 docker image inspect "$IMAGE" >/dev/null 2>&1 || die "image $IMAGE missing: $why build it"
-ls -d "$(model_cache_dir)"/snapshots/*/ >/dev/null 2>&1 || die "$MODEL_ID not in $HF_CACHE: $why download it"
+if is_local_model; then
+  [[ -d "${MODEL_DIR:-$MODEL_ID}" ]] || die "local model directory ${MODEL_DIR:-$MODEL_ID} missing"
+else
+  ls -d "$(model_cache_dir)"/snapshots/*/ >/dev/null 2>&1 || die "$MODEL_ID not in $HF_CACHE: $why download it"
+fi
 
 # ---------------------------------------------------------------- 2. checks
 step 2 "Checks: arguments, previous server, port, memory"
+target_model="$(container_model_target)"
 # tensorfold's own parser, in a throwaway container without the GPU: a typo fails here, before anything is stopped
 docker run --rm --entrypoint python "$IMAGE" -c \
   'import sys; from tensorfold.cli import build_parser; build_parser().parse_args(sys.argv[1:])' \
-  serve "$MODEL_ID" --host "$HOST" --port "$PORT" "${SERVE_ARGS[@]}" >/dev/null ||
+  serve "$target_model" --host "$HOST" --port "$PORT" "${SERVE_ARGS[@]}" >/dev/null ||
   die "tensorfold serve rejects these arguments (see above); nothing was changed"
 if [[ "$MODE" == restart ]] && running; then          # after the setup and the checks: down only while restarting
   ./stop.sh
@@ -137,17 +142,22 @@ while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name"); done < <(env | grep -E 
 
 # ---------------------------------------------------------------- 3. launch
 step 3 "Launch: container $CONTAINER_NAME"
-log "tensorfold serve $MODEL_ID --host $HOST --port $PORT ${SERVE_ARGS[*]}"
+log "tensorfold serve $target_model --host $HOST --port $PORT ${SERVE_ARGS[*]}"
+MODEL_MOUNT=()
+if is_local_model; then
+  MODEL_MOUNT=(-v "${MODEL_DIR:-$MODEL_ID}":/model)
+fi
 # No token goes into the container: serving reads only the local cache (HF_HUB_OFFLINE=1), and with
 # HF_HUB_OFFLINE=0 huggingface_hub finds the token file in the mounted cache.
 docker run -d --name "$CONTAINER_NAME" \
   --gpus all --ipc=host --network host \
   --ulimit memlock=-1 --ulimit stack=67108864 \
   -e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" "${ENV_ARGS[@]}" \
+  "${MODEL_MOUNT[@]}" \
   -v "$HF_CACHE":/root/.cache/huggingface \
   -v "$KERNEL_CACHE":/cache \
   "$IMAGE" \
-  tensorfold serve "$MODEL_ID" --host "$HOST" --port "$PORT" "${SERVE_ARGS[@]}" >/dev/null
+  tensorfold serve "$target_model" --host "$HOST" --port "$PORT" "${SERVE_ARGS[@]}" >/dev/null
 
 if [[ "${FOREGROUND:-0}" == 1 ]]; then
   trap './stop.sh; exit 130' INT TERM

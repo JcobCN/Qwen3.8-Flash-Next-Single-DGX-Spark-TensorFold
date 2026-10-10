@@ -1,0 +1,53 @@
+services:
+  qwen38-flash-next-tf:
+    image: ${IMAGE:-hello/qwen3.8-flash-next-single-dgx-spark-tensorfold:lastest}
+    container_name: ${CONTAINER_NAME:-qwen38-flash-next-tf}
+    restart: unless-stopped
+    ipc: host
+    network_mode: host
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      stack:
+        soft: 67108864
+        hard: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - HF_HUB_OFFLINE=1
+      - TENSORFOLD_PREFILL_ROWS=2048
+      - TENSORFOLD_VISION_WORKSPACE_MIB=0
+      - TENSORFOLD_IMAGE_TOKENS=16384
+      - TENSORFOLD_VIDEO_TOKENS=16384
+      - TENSORFOLD_MEMORY_RESERVE_GIB=2
+      - TENSORFOLD_MTP_COPY=1
+      - TENSORFOLD_NO_UPDATE_CHECK=1
+      - TENSORFOLD_DRAFT_VOCAB=zh
+    volumes:
+      - ${MODEL_PATH:-/home/clouder/model-gguf/Qwen3.8-Flash-Next-MLX-4bit-MTP}:/model:ro
+      - ${KERNEL_CACHE:-/home/clouder/.cache/tensorfold-qwen38}:/cache
+      - ${HF_CACHE:-/home/clouder/.cache/huggingface}:/root/.cache/huggingface
+    command: >
+      tensorfold serve /model
+      --name ${SERVED_NAME:-Qwen3.8-Flash-Next}
+      --host ${HOST:-0.0.0.0}
+      --port ${PORT:-8888}
+      --parallel ${PARALLEL:-5}
+      --context ${CONTEXT:-262144}
+      --kv-dtype ${KV_DTYPE:-int8}
+      --mtp-drafts ${MTP_DRAFTS:-6}
+      --mtp-confidence ${MTP_CONFIDENCE:-0.60}
+      --temperature ${TEMPERATURE:-1.0}
+      --top-p ${TOP_P:-0.95}
+      --top-k ${TOP_K:-20}
+      --max-tokens ${MAX_TOKENS:-32768}
+      --ple-on-ssd
+      --vision
+      --vision-max-images ${VISION_MAX_IMAGES:-50}
+      --thinking

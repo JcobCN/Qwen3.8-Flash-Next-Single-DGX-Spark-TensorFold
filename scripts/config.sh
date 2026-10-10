@@ -14,7 +14,12 @@ if [[ -f .env ]]; then
   done < .env
 fi
 
-MODEL_ID="${MODEL_ID:-Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP}"   # MLX 4-bit, group size 32, with the MTP head
+# Model directory / ID
+# Defaults to ~/model-gguf/Qwen3.8-Flash-Next-MLX-4bit-MTP on the host, mounted to /model in the container.
+MODEL_DIR="${MODEL_DIR:-${MODEL_PATH:-$HOME/model-gguf/Qwen3.8-Flash-Next-MLX-4bit-MTP}}"
+MODEL_DIR="${MODEL_DIR/#\~/$HOME}"
+MODEL_ID="${MODEL_ID:-$MODEL_DIR}"
+MODEL_ID="${MODEL_ID/#\~/$HOME}"
 # The patches and start.sh's flags are made for TensorFold v0.6.1 exactly (17c73e1). After changing
 # TF_VERSION, TF_REPO or BASE_IMAGE, run `scripts/prepare.sh --rebuild`.
 TF_VERSION="${TF_VERSION:-v0.6.1}"
@@ -24,11 +29,12 @@ BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
 # language's tokens to the ones MTP drafts may propose (patches/languages/): faster decoding there, the same
 # output. English and code get a little slower with it, so leave it unset otherwise. Also accepted, not measured to help:
 # de, fr, pt, ru; several: "zh,ja". See the README's "Other languages" section.
-DRAFT_LANGUAGE="${DRAFT_LANGUAGE:-}"
+DRAFT_LANGUAGE="${DRAFT_LANGUAGE:-zh}"
 IMAGE="${IMAGE:-tensorfold-qwen38:${TF_VERSION}${DRAFT_LANGUAGE:+-languages}}"   # the local image prepare.sh builds or pulls
 CONTAINER_NAME="${CONTAINER_NAME:-qwen38-flash-next-tf}"          # the server's container
-# The prebuilt images: prepare.sh pulls $GHCR_IMAGE:<TF_VERSION>-<patches hash>; publish-image.sh pushes it (and
-# :latest, or :languages for the DRAFT_LANGUAGE image).
+# The prebuilt image: prepare.sh uses PREIMAGE (default hello/qwen3.8-flash-next-single-dgx-spark-tensorfold:lastest,
+# whether DRAFT_LANGUAGE is set or not); publish-image.sh pushes it (and :latest, or :languages for the DRAFT_LANGUAGE image).
+PREIMAGE="${PREIMAGE:-hello/qwen3.8-flash-next-single-dgx-spark-tensorfold:lastest}"
 GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold}"
 
 SERVED_NAME="${SERVED_NAME:-Qwen3.8-Flash-Next}"   # the model id clients see in /v1/models and replies (tensorfold --name)
@@ -104,7 +110,23 @@ log()  { printf '%s[%s]%s %s\n' "$(_c 1 '1;36')" "$(basename "$0")" "$(_c 1 0)" 
 warn() { printf '%s[%s] WARN:%s %s\n' "$(_c 2 '1;33')" "$(basename "$0")" "$(_c 2 0)" "$*" >&2; }
 die()  { printf '%s[%s] ERROR:%s %s\n' "$(_c 2 '1;31')" "$(basename "$0")" "$(_c 2 0)" "$*" >&2; exit 1; }
 
-model_cache_dir() { echo "$HF_CACHE/hub/models--${MODEL_ID//\//--}"; }
+is_local_model() { [[ -d "$MODEL_DIR" || -d "$MODEL_ID" || "$MODEL_ID" == /* || "$MODEL_DIR" == /* ]]; }
+
+container_model_target() {
+  if is_local_model; then
+    echo "/model"
+  else
+    echo "$MODEL_ID"
+  fi
+}
+
+model_cache_dir() {
+  if is_local_model; then
+    echo "${MODEL_DIR:-$MODEL_ID}"
+  else
+    echo "$HF_CACHE/hub/models--${MODEL_ID//\//--}"
+  fi
+}
 
 # start.sh and scripts/*.sh (not stop.sh, which must stop the server whatever the settings) check DRAFT_LANGUAGE.
 check_draft_language() {
@@ -123,6 +145,10 @@ prepared_state() {
   local hash label model=missing
   hash=$(patches_hash)
   label=$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || echo missing)
-  ls -d "$(model_cache_dir)"/snapshots/*/ >/dev/null 2>&1 && model=present
-  echo "model=$MODEL_ID($model) image=$IMAGE($label) patches=$hash"
+  if is_local_model; then
+    [[ -d "${MODEL_DIR:-$MODEL_ID}" ]] && model=present
+  else
+    ls -d "$(model_cache_dir)"/snapshots/*/ >/dev/null 2>&1 && model=present
+  fi
+  echo "model=${MODEL_DIR:-$MODEL_ID}($model) image=$IMAGE($label) patches=$hash"
 }
