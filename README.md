@@ -383,3 +383,12 @@ Built on [TensorFold](https://github.com/ashhart/TensorFold) by Ash Hart ([ashha
 by Qwen, and [Vontra's MLX 4-bit checkpoint](https://huggingface.co/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP), with a
 prompt-chunk change by [MovieMaker93](https://github.com/MovieMaker93) ([TensorFold #40](https://github.com/ashhart/TensorFold/pull/40)). The full list,
 including the runtime stack and licenses, is in [`CREDITS.md`](CREDITS.md).
+
+---
+
+## LMCache Cross-Node KV Cache Sharing
+
+本项目已完成接入 **LMCache**，支持两台 DGX Spark 节点间混合架构（Full Attention KV + Gated DeltaNet 循环/卷积隐状态 + MTP）的前缀跨节点秒级复用。
+
+详细架构原理、代码修改点与未来镜像升级 SOP 请参考：
+- 📖 [LMCache 改造与维护升级指南](docs/LMCACHE_TRANSFORMATION_GUIDE.md)

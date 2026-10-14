@@ -1,0 +1,34 @@
+--- /usr/local/lib/python3.12/dist-packages/tensorfold/families/qwen4_exp/cuda/prefixes.py.bak	2026-10-13 09:17:49.000000000 +0000
++++ /usr/local/lib/python3.12/dist-packages/tensorfold/families/qwen4_exp/cuda/prefixes.py	2026-10-13 09:25:01.820754275 +0000
+@@ -1,5 +1,7 @@
+ """Select and retain prompt prefixes without consuming a longer chain when a spare slot can hold a copy."""
+ 
++from tensorfold import lmcache_bridge
++
+ 
+ def _best(kept, prompt, busy=()):
+     return max((k for k in kept if id(k[1]) not in busy and len(k[0]) < len(prompt)
+@@ -36,6 +38,13 @@
+         owner.kept = [k for k in owner.kept if k[1] is not best[1]
+                       or len(k[0]) <= n and best[0][:len(k[0])] == k[0]]
+         return best[1], {"state": best[2], "tail": best[3]}, n
++
++    # Remote LMCache lookup if local in-memory kept did not hit
++    if reuse:
++        remote = lmcache_bridge.retrieve(owner, prompt)
++        if remote is not None:
++            return remote
++
+     if not owner.free:
+         idle = next((k[1] for k in owner.kept if id(k[1]) not in busy), None)
+         if idle is None:
+@@ -57,3 +66,9 @@
+         if old is not st and id(old) not in busy and all(k[1] is not old for k in owner.kept) and \
+                 all(f is not old for f in owner.free):
+             owner.free.append(old)
++
++    # Remote LMCache async store
++    try:
++        lmcache_bridge.async_store(ids, st, snap, tail)
++    except Exception:
++        pass
