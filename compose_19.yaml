@@ -1,10 +1,10 @@
 services:
   lmcache-server:
-    image: ${LMCACHE_IMAGE:-hello/qwen3.8-flash-next-single-dgx-spark-tensorfold:lmcache}
+    image: ${LMCACHE_IMAGE:-lmcache/standalone:v0.5.6-arm64}
     container_name: lmcache-server
     restart: unless-stopped
     network_mode: host
-    command: python3 /usr/local/bin/lmcache_server 0.0.0.0 8998 cpu
+    command: lmcache_server 0.0.0.0 8998 cpu
 
   qwen38-flash-next-tf:
     image: ${IMAGE:-hello/qwen3.8-flash-next-single-dgx-spark-tensorfold:lmcache}

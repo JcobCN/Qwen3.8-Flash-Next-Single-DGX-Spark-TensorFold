@@ -29,22 +29,43 @@
        ▼                    ▼
 ┌───────────────────────────────────┐
 │     LMCache Server (0.0.0.0:8998) │
-│     (部署在 19 或独立的集中节点)    │
+│     (基于官方 standalone 独立镜像部署)│
 └───────────────────────────────────┘
 ```
 
 ---
 
-## 2. 依赖环境安装（可在新容器内执行）
+## 2. 依赖环境与镜像准备
 
-LMCache 官方提供 aarch64 Python 3.12 预编译 Wheel 包：
+整个体系分为两部分：**推理端（TensorFold Client）** 和 **缓存服务端（LMCache Server）**，两者镜像完全解耦。
+
+### 2.1 推理端依赖（TensorFold 容器内）
+LMCache 官方提供 aarch64 Python 3.12 预编译 Wheel 包，在 TensorFold 容器内安装供 `lmcache_bridge.py` 客户端调用：
 
 ```bash
-# 在容器内安装 lmcache 及核心依赖
+# 在 TensorFold 容器内安装 lmcache
 pip install lmcache
 ```
 
 > **注意**：若目标机器无法直连外网，可通过内网从已安装节点同步 `/usr/local/lib/python3.12/dist-packages/` 下与 `lmcache` 相关的依赖包，或使用离线 wheel 缓存。
+
+### 2.2 缓存服务端镜像（LMCache Server）
+缓存服务端不占用 GPU，不需要大模型运行时，直接使用官方独立的 ARM64 镜像：
+`lmcache/standalone:v0.5.6-arm64`
+
+分发方式：
+1. 在可直连公网的跳板机（`10.100.10.155`）上拉取 ARM64 镜像：
+   ```bash
+   docker pull lmcache/standalone:v0.5.6-arm64
+   ```
+2. 通过 155 的内部 HTTP 共享服务（端口 5000）将镜像保存并分发给 19 号节点：
+   ```bash
+   # 在 155 上保存镜像到 dufs 共享目录
+   docker save lmcache/standalone:v0.5.6-arm64 -o /home/clouder/Downloads/lmcache-standalone-v0.5.6-arm64.tar
+
+   # 在 19 号机上下载并导入
+   curl -s http://10.100.10.155:5000/lmcache-standalone-v0.5.6-arm64.tar | docker load
+   ```
 
 ---
 
@@ -442,8 +463,8 @@ def async_store(ids: list[int], st, snap: dict, tail: torch.Tensor | None):
 
 当官方或实验室提供了新的基础镜像（例如新版 `hello/...:latest`）时，按以下步骤快速重新部署：
 
-### 步骤 1：安装依赖并提交新镜像
-在 19 和 20 节点上拉取新镜像后，启动临时容器安装 `lmcache` 并提交：
+### 步骤 1：准备推理端镜像（19 和 20 节点）
+在 19 和 20 节点上拉取新镜像后，启动临时容器安装 `lmcache` 并提交为专用 tag：
 ```bash
 docker run -d --name tf-temp <NEW_IMAGE> tail -f /dev/null
 docker exec tf-temp pip install lmcache
@@ -451,30 +472,41 @@ docker commit tf-temp hello/qwen3.8-flash-next-single-dgx-spark-tensorfold:lmcac
 docker rm -f tf-temp
 ```
 
-### 步骤 2：维护宿主机持久化文件与挂载
-确保宿主机的部署目录（例如 `/home/clouder/Qwen3.8-Flash-Single/`）存放了修改后的源码：
+### 步骤 2：准备 LMCache Server 镜像（仅 19 号节点）
+LMCache Server 不使用庞大的 TensorFold 镜像，使用官方独立镜像 `lmcache/standalone:v0.5.6-arm64`：
+```bash
+# 在 10.100.10.155 上拉取并保存到共享目录
+docker pull lmcache/standalone:v0.5.6-arm64
+docker save lmcache/standalone:v0.5.6-arm64 -o /home/clouder/Downloads/lmcache-standalone-v0.5.6-arm64.tar
+
+# 在 19 节点上导入镜像
+curl -s http://10.100.10.155:5000/lmcache-standalone-v0.5.6-arm64.tar | docker load
+```
+
+### 步骤 3：维护宿主机持久化文件与 Compose 配置
+确保两台宿主机的部署目录（`/home/clouder/Qwen3.8-Flash-Single/`）存放了修改后的源码：
 - `lmcache_bridge.py`
 - `prefixes.py`
 
-在 `compose.yaml` 中配置 Volume 映射（双保险机制）：
+#### 19 号节点配置（对应仓库 `compose_19.yaml`）
+19 节点同时运行 `lmcache-server` 和推理服务：
 ```yaml
 services:
-  # 19 号节点额外运行此常驻服务
+  # 19 号节点专属常驻 KV Cache 缓存服务（官方独立镜像）
   lmcache-server:
-    image: hello/qwen3.8-flash-next-single-dgx-spark-tensorfold:lmcache
+    image: ${LMCACHE_IMAGE:-lmcache/standalone:v0.5.6-arm64}
     container_name: lmcache-server
     restart: unless-stopped
     network_mode: host
-    command: python3 /usr/local/bin/lmcache_server 0.0.0.0 8998 cpu
+    command: lmcache_server 0.0.0.0 8998 cpu
 
   qwen38-flash-next-tf:
-    image: hello/qwen3.8-flash-next-single-dgx-spark-tensorfold:lmcache
-    container_name: qwen38-flash-next-tf
+    image: ${IMAGE:-hello/qwen3.8-flash-next-single-dgx-spark-tensorfold:lmcache}
+    container_name: ${CONTAINER_NAME:-qwen38-flash-next-tf}
     restart: unless-stopped
     ipc: host
     network_mode: host
     environment:
-      # 开启 LMCache 配置
       - TENSORFOLD_LMCACHE=1
       - LMCACHE_SERVER_HOST=192.168.1.19
       - LMCACHE_SERVER_PORT=8998
@@ -484,23 +516,47 @@ services:
       - /home/clouder/model-gguf/Qwen3.8-Flash-Next-MLX-4bit-MTP:/model:ro
       - /home/clouder/.cache/tensorfold-qwen38:/cache
       - /home/clouder/.cache/huggingface:/root/.cache/huggingface
-      # 持久化注入核心桥接代码
       - /home/clouder/Qwen3.8-Flash-Single/lmcache_bridge.py:/usr/local/lib/python3.12/dist-packages/tensorfold/lmcache_bridge.py:ro
       - /home/clouder/Qwen3.8-Flash-Single/prefixes.py:/usr/local/lib/python3.12/dist-packages/tensorfold/families/qwen4_exp/cuda/prefixes.py:ro
     command: >
       tensorfold serve /model ...
 ```
 
-### 步骤 3：启动服务
+#### 20 号节点配置（对应仓库 `compose_20.yaml`）
+20 节点仅需运行推理服务，其 `LMCACHE_SERVER_HOST` 指向 `192.168.1.19`：
+```yaml
+services:
+  qwen38-flash-next-tf:
+    image: ${IMAGE:-hello/qwen3.8-flash-next-single-dgx-spark-tensorfold:lmcache}
+    container_name: ${CONTAINER_NAME:-qwen38-flash-next-tf}
+    restart: unless-stopped
+    ipc: host
+    network_mode: host
+    environment:
+      - TENSORFOLD_LMCACHE=1
+      - LMCACHE_SERVER_HOST=192.168.1.19
+      - LMCACHE_SERVER_PORT=8998
+      - LMCACHE_MIN_TOKENS=256
+      # 其余原有环境变量保持不变...
+    volumes:
+      - /home/clouder/model-gguf/Qwen3.8-Flash-Next-MLX-4bit-MTP:/model:ro
+      - /home/clouder/.cache/tensorfold-qwen38:/cache
+      - /home/clouder/.cache/huggingface:/root/.cache/huggingface
+      - /home/clouder/Qwen3.8-Flash-Single/lmcache_bridge.py:/usr/local/lib/python3.12/dist-packages/tensorfold/lmcache_bridge.py:ro
+      - /home/clouder/Qwen3.8-Flash-Single/prefixes.py:/usr/local/lib/python3.12/dist-packages/tensorfold/families/qwen4_exp/cuda/prefixes.py:ro
+    command: >
+      tensorfold serve /model ...
+```
+
+### 步骤 4：启动服务
 ```bash
-# 在 19 节点
+# 在 19 节点（启动 lmcache-server 与 19 号推理引擎）
 cd /home/clouder/Qwen3.8-Flash-Single
 docker compose up -d
 
-# 在 20 节点
+# 在 20 节点（启动 20 号推理引擎）
 cd /home/clouder/Qwen3.8-Flash-Single
-docker compose up -d qwen38-flash-next-tf
-```
+docker compose up -d
 
 ---
 
